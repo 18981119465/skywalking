@@ -23,11 +23,9 @@ import java.util.concurrent.ArrayBlockingQueue;
 
 /**
  * The buffer implementation based on JDK ArrayBlockingQueue.
- *
+ * <p>
  * This implementation has better performance in server side. We are still trying to research whether this is suitable
  * for agent side, which is more sensitive about blocks.
- *
- * @author wusheng
  */
 public class ArrayBlockingQueueBuffer<T> implements QueueBuffer<T> {
     private BufferStrategy strategy;
@@ -40,30 +38,30 @@ public class ArrayBlockingQueueBuffer<T> implements QueueBuffer<T> {
         this.bufferSize = bufferSize;
     }
 
-    @Override public boolean save(T data) {
-        switch (strategy) {
-            case IF_POSSIBLE:
-                return queue.offer(data);
-            default:
-                try {
-                    queue.put(data);
-                } catch (InterruptedException e) {
-                    // Ignore the error
-                    return false;
-                }
+    @Override
+    public boolean save(T data) {
+        //only BufferStrategy.BLOCKING
+        try {
+            queue.put(data);
+        } catch (InterruptedException e) {
+            // Ignore the error
+            return false;
         }
         return true;
     }
 
-    @Override public void setStrategy(BufferStrategy strategy) {
+    @Override
+    public void setStrategy(BufferStrategy strategy) {
         this.strategy = strategy;
     }
 
-    @Override public void obtain(List<T> consumeList) {
+    @Override
+    public void obtain(List<T> consumeList) {
         queue.drainTo(consumeList);
     }
 
-    @Override public int getBufferSize() {
+    @Override
+    public int getBufferSize() {
         return bufferSize;
     }
 }

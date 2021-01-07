@@ -15,6 +15,7 @@
  * limitations under the License.
  *
  */
+
 package org.apache.skywalking.apm.testcase.elasticsearch.config;
 
 import org.apache.http.HttpHost;
@@ -24,9 +25,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-/**
- * @author aderm
- */
 @Configuration
 public class ElasticsearchConfig {
 
@@ -36,7 +34,7 @@ public class ElasticsearchConfig {
     @Bean(destroyMethod = "close")
     public RestHighLevelClient client() {
         HttpHost[] httpHostArry = parseEsHost();
-        RestHighLevelClient client = new RestHighLevelClient((RestClient.builder(httpHostArry)));
+        RestHighLevelClient client = new RestHighLevelClient(RestClient.builder(httpHostArry));
         return client;
     }
 

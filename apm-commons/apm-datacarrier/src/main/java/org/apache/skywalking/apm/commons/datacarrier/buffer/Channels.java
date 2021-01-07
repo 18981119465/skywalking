@@ -27,7 +27,7 @@ import org.apache.skywalking.apm.commons.datacarrier.partition.IDataPartitioner;
 public class Channels<T> {
     private final QueueBuffer<T>[] bufferChannels;
     private IDataPartitioner<T> dataPartitioner;
-    private BufferStrategy strategy;
+    private final BufferStrategy strategy;
     private final long size;
 
     public Channels(int channelSize, int bufferSize, IDataPartitioner<T> partitioner, BufferStrategy strategy) {
@@ -36,12 +36,13 @@ public class Channels<T> {
         bufferChannels = new QueueBuffer[channelSize];
         for (int i = 0; i < channelSize; i++) {
             if (BufferStrategy.BLOCKING.equals(strategy)) {
-                bufferChannels[i] = new ArrayBlockingQueueBuffer<T>(bufferSize, strategy);
+                bufferChannels[i] = new ArrayBlockingQueueBuffer<>(bufferSize, strategy);
             } else {
-                bufferChannels[i] = new Buffer<T>(bufferSize, strategy);
+                bufferChannels[i] = new Buffer<>(bufferSize, strategy);
             }
         }
-        size = channelSize * bufferSize;
+        // noinspection PointlessArithmeticExpression
+        size = 1L * channelSize * bufferSize; // it's not pointless, it prevents numeric overflow before assigning an integer to a long
     }
 
     public boolean save(T data) {
@@ -68,8 +69,6 @@ public class Channels<T> {
     /**
      * override the strategy at runtime. Notice, this will override several channels one by one. So, when running
      * setStrategy, each channel may use different BufferStrategy
-     *
-     * @param strategy
      */
     public void setStrategy(BufferStrategy strategy) {
         for (QueueBuffer<T> buffer : bufferChannels) {
@@ -79,8 +78,6 @@ public class Channels<T> {
 
     /**
      * get channelSize
-     *
-     * @return
      */
     public int getChannelSize() {
         return this.bufferChannels.length;

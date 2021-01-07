@@ -18,9 +18,20 @@
 
 package org.apache.skywalking.oap.server.storage.plugin.elasticsearch7.client;
 
+import java.io.IOException;
+import java.security.KeyManagementException;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.CertificateException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.http.HttpHost;
 import org.apache.http.HttpStatus;
 import org.apache.skywalking.oap.server.library.client.elasticsearch.ElasticSearchClient;
+import org.apache.skywalking.oap.server.library.client.elasticsearch.IndexNameConverter;
 import org.apache.skywalking.oap.server.library.client.request.InsertRequest;
 import org.apache.skywalking.oap.server.library.client.request.UpdateRequest;
 import org.elasticsearch.action.admin.indices.alias.Alias;
@@ -37,6 +48,7 @@ import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.search.SearchResponse;
 import org.elasticsearch.action.support.ActiveShardCount;
+import org.elasticsearch.action.support.IndicesOptions;
 import org.elasticsearch.action.support.WriteRequest;
 import org.elasticsearch.action.support.master.AcknowledgedResponse;
 import org.elasticsearch.client.GetAliasesResponse;
@@ -52,40 +64,42 @@ import org.elasticsearch.index.query.QueryBuilders;
 import org.elasticsearch.index.reindex.BulkByScrollResponse;
 import org.elasticsearch.index.reindex.DeleteByQueryRequest;
 import org.elasticsearch.search.builder.SearchSourceBuilder;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.IOException;
-import java.security.KeyManagementException;
-import java.security.KeyStoreException;
-import java.security.NoSuchAlgorithmException;
-import java.security.cert.CertificateException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
 
 /**
- * @author peng-yongsheng
- * @author kezhenxu94
+ *
  */
+@Slf4j
 public class ElasticSearch7Client extends ElasticSearchClient {
-
-    private static final Logger logger = LoggerFactory.getLogger(ElasticSearch7Client.class);
-
     public ElasticSearch7Client(final String clusterNodes,
                                 final String protocol,
                                 final String trustStorePath,
                                 final String trustStorePass,
-                                final String namespace, final String user, final String password) {
-        super(clusterNodes, protocol, trustStorePath, trustStorePass, namespace, user, password);
+                                final String user,
+                                final String password,
+                                List<IndexNameConverter> indexNameConverters) {
+        super(
+            clusterNodes, protocol, trustStorePath, trustStorePass, user, password,
+            indexNameConverters
+        );
     }
 
     @Override
     public void connect() throws IOException, KeyStoreException, NoSuchAlgorithmException, KeyManagementException, CertificateException {
-        List<HttpHost> hosts = parseClusterNodes(protocol, clusterNodes);
-        client = createClient(hosts);
-        client.ping(RequestOptions.DEFAULT);
+        connectLock.lock();
+        try {
+            if (client != null) {
+                try {
+                    client.close();
+                } catch (Throwable t) {
+                    log.error("ElasticSearch7 client reconnection fails based on new config", t);
+                }
+            }
+            List<HttpHost> hosts = parseClusterNodes(protocol, clusterNodes);
+            client = createClient(hosts);
+            client.ping(RequestOptions.DEFAULT);
+        } finally {
+            connectLock.unlock();
+        }
     }
 
     public boolean createIndex(String indexName) throws IOException {
@@ -93,19 +107,18 @@ public class ElasticSearch7Client extends ElasticSearchClient {
 
         CreateIndexRequest request = new CreateIndexRequest(indexName);
         CreateIndexResponse response = client.indices().create(request, RequestOptions.DEFAULT);
-        logger.debug("create {} index finished, isAcknowledged: {}", indexName, response.isAcknowledged());
+        log.debug("create {} index finished, isAcknowledged: {}", indexName, response.isAcknowledged());
         return response.isAcknowledged();
     }
 
-    public boolean createIndex(String indexName,
-                               Map<String, Object> settings,
+    public boolean createIndex(String indexName, Map<String, Object> settings,
                                Map<String, Object> mapping) throws IOException {
         indexName = formatIndexName(indexName);
         CreateIndexRequest request = new CreateIndexRequest(indexName);
         request.settings(settings);
         request.mapping(mapping);
         CreateIndexResponse response = client.indices().create(request, RequestOptions.DEFAULT);
-        logger.debug("create {} index finished, isAcknowledged: {}", indexName, response.isAcknowledged());
+        log.debug("create {} index finished, isAcknowledged: {}", indexName, response.isAcknowledged());
         return response.isAcknowledged();
     }
 
@@ -117,7 +130,14 @@ public class ElasticSearch7Client extends ElasticSearchClient {
         aliases = formatIndexName(aliases);
 
         GetAliasesRequest getAliasesRequest = new GetAliasesRequest(aliases);
-        GetAliasesResponse alias = client.indices().getAlias(getAliasesRequest, RequestOptions.DEFAULT);
+        GetAliasesResponse alias;
+        try {
+            alias = client.indices().getAlias(getAliasesRequest, RequestOptions.DEFAULT);
+            healthChecker.health();
+        } catch (Throwable t) {
+            healthChecker.unHealth(t);
+            throw t;
+        }
         return new ArrayList<>(alias.getAliases().keySet());
     }
 
@@ -127,7 +147,7 @@ public class ElasticSearch7Client extends ElasticSearchClient {
         }
         DeleteIndexRequest request = new DeleteIndexRequest(indexName);
         AcknowledgedResponse response = client.indices().delete(request, RequestOptions.DEFAULT);
-        logger.debug("delete {} index finished, isAcknowledged: {}", indexName, response.isAcknowledged());
+        log.debug("delete {} index finished, isAcknowledged: {}", indexName, response.isAcknowledged());
         return response.isAcknowledged();
     }
 
@@ -145,20 +165,19 @@ public class ElasticSearch7Client extends ElasticSearchClient {
         return client.indices().existsTemplate(indexTemplatesExistRequest, RequestOptions.DEFAULT);
     }
 
-    public boolean createTemplate(String indexName,
-                                  Map<String, Object> settings,
+    public boolean createTemplate(String indexName, Map<String, Object> settings,
                                   Map<String, Object> mapping) throws IOException {
         indexName = formatIndexName(indexName);
 
-        PutIndexTemplateRequest putIndexTemplateRequest =
-            new PutIndexTemplateRequest(indexName)
-                .patterns(Collections.singletonList(indexName + "-*"))
-                .alias(new Alias(indexName))
-                .settings(settings)
-                .mapping(mapping);
+        PutIndexTemplateRequest putIndexTemplateRequest = new PutIndexTemplateRequest(indexName).patterns(
+            Collections.singletonList(indexName + "-*"))
+                                                                                                .alias(new Alias(
+                                                                                                    indexName))
+                                                                                                .settings(settings)
+                                                                                                .mapping(mapping);
 
-        AcknowledgedResponse acknowledgedResponse =
-            client.indices().putTemplate(putIndexTemplateRequest, RequestOptions.DEFAULT);
+        AcknowledgedResponse acknowledgedResponse = client.indices()
+                                                          .putTemplate(putIndexTemplateRequest, RequestOptions.DEFAULT);
 
         return acknowledgedResponse.isAcknowledged();
     }
@@ -167,58 +186,80 @@ public class ElasticSearch7Client extends ElasticSearchClient {
         indexName = formatIndexName(indexName);
 
         DeleteIndexTemplateRequest deleteIndexTemplateRequest = new DeleteIndexTemplateRequest(indexName);
-        AcknowledgedResponse acknowledgedResponse = client.indices().deleteTemplate(deleteIndexTemplateRequest, RequestOptions.DEFAULT);
+        AcknowledgedResponse acknowledgedResponse = client.indices()
+                                                          .deleteTemplate(
+                                                              deleteIndexTemplateRequest, RequestOptions.DEFAULT);
 
         return acknowledgedResponse.isAcknowledged();
     }
 
-    public SearchResponse search(
-        String indexName,
-        SearchSourceBuilder searchSourceBuilder) throws IOException {
-        indexName = formatIndexName(indexName);
-        SearchRequest searchRequest = new SearchRequest(indexName);
+    @Override
+    public SearchResponse doSearch(SearchSourceBuilder searchSourceBuilder, String... indexNames) throws IOException {
+        SearchRequest searchRequest = new SearchRequest(indexNames);
+        searchRequest.indicesOptions(IndicesOptions.fromOptions(true, true, true, false));
         searchRequest.source(searchSourceBuilder);
-        return client.search(searchRequest, RequestOptions.DEFAULT);
+        try {
+            SearchResponse response = client.search(searchRequest, RequestOptions.DEFAULT);
+            healthChecker.health();
+            return response;
+        } catch (Throwable t) {
+            healthChecker.unHealth(t);
+            handleIOPoolStopped(t);
+            throw t;
+        }
     }
 
     public GetResponse get(String indexName, String id) throws IOException {
         indexName = formatIndexName(indexName);
         GetRequest request = new GetRequest(indexName, id);
-        return client.get(request, RequestOptions.DEFAULT);
+        try {
+            GetResponse response = client.get(request, RequestOptions.DEFAULT);
+            healthChecker.health();
+            return response;
+        } catch (Throwable t) {
+            healthChecker.unHealth(t);
+            throw t;
+        }
     }
 
-    public SearchResponse ids(
-        String indexName,
-        String[] ids) throws IOException {
+    public SearchResponse ids(String indexName, String[] ids) throws IOException {
         indexName = formatIndexName(indexName);
 
         SearchRequest searchRequest = new SearchRequest(indexName);
         searchRequest.source().query(QueryBuilders.idsQuery().addIds(ids)).size(ids.length);
-        return client.search(searchRequest, RequestOptions.DEFAULT);
+        try {
+            SearchResponse response = client.search(searchRequest, RequestOptions.DEFAULT);
+            healthChecker.health();
+            return response;
+        } catch (Throwable t) {
+            healthChecker.unHealth(t);
+            throw t;
+        }
     }
 
     public void forceInsert(String indexName, String id, XContentBuilder source) throws IOException {
         IndexRequest request = (IndexRequest) prepareInsert(indexName, id, source);
         request.setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
-        client.index(request, RequestOptions.DEFAULT);
-    }
-
-    public void forceUpdate(String indexName,
-                            String id,
-                            XContentBuilder source,
-                            long seqNo,
-                            long primaryTerm) throws IOException {
-        org.elasticsearch.action.update.UpdateRequest request = (org.elasticsearch.action.update.UpdateRequest) prepareUpdate(indexName, id, source);
-        request.setIfSeqNo(seqNo);
-        request.setIfPrimaryTerm(primaryTerm);
-        request.setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
-        client.update(request, RequestOptions.DEFAULT);
+        try {
+            client.index(request, RequestOptions.DEFAULT);
+            healthChecker.health();
+        } catch (Throwable t) {
+            healthChecker.unHealth(t);
+            throw t;
+        }
     }
 
     public void forceUpdate(String indexName, String id, XContentBuilder source) throws IOException {
-        org.elasticsearch.action.update.UpdateRequest request = (org.elasticsearch.action.update.UpdateRequest) prepareUpdate(indexName, id, source);
+        org.elasticsearch.action.update.UpdateRequest request = (org.elasticsearch.action.update.UpdateRequest) prepareUpdate(
+            indexName, id, source);
         request.setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
-        client.update(request, RequestOptions.DEFAULT);
+        try {
+            client.update(request, RequestOptions.DEFAULT);
+            healthChecker.health();
+        } catch (Throwable t) {
+            healthChecker.unHealth(t);
+            throw t;
+        }
     }
 
     public InsertRequest prepareInsert(String indexName, String id, XContentBuilder source) {
@@ -231,21 +272,16 @@ public class ElasticSearch7Client extends ElasticSearchClient {
         return new ElasticSearch7UpdateRequest(indexName, id).doc(source);
     }
 
-    public int delete(
-        String indexName,
-        String timeBucketColumnName,
-        long endTimeBucket) throws IOException {
+    public int delete(String indexName, String timeBucketColumnName, long endTimeBucket) throws IOException {
         indexName = formatIndexName(indexName);
 
         DeleteByQueryRequest deleteByQueryRequest = new DeleteByQueryRequest(indexName);
         deleteByQueryRequest.setAbortOnVersionConflict(false);
-        deleteByQueryRequest.setQuery(
-            QueryBuilders.rangeQuery(timeBucketColumnName).lte(endTimeBucket)
-        );
+        deleteByQueryRequest.setQuery(QueryBuilders.rangeQuery(timeBucketColumnName).lte(endTimeBucket));
         BulkByScrollResponse bulkByScrollResponse = client.deleteByQuery(deleteByQueryRequest, RequestOptions.DEFAULT);
-        logger.debug(
-            "delete indexName: {}, by query request: {}, response: {}",
-            indexName, deleteByQueryRequest, bulkByScrollResponse
+        log.debug(
+            "delete indexName: {}, by query request: {}, response: {}", indexName, deleteByQueryRequest,
+            bulkByScrollResponse
         );
         return HttpStatus.SC_OK;
     }
@@ -257,9 +293,10 @@ public class ElasticSearch7Client extends ElasticSearchClient {
         try {
             int size = request.requests().size();
             BulkResponse responses = client.bulk(request, RequestOptions.DEFAULT);
-            logger.info("Synchronous bulk took time: {} millis, size: {}", responses.getTook().getMillis(), size);
-        } catch (IOException e) {
-            logger.error(e.getMessage(), e);
+            log.info("Synchronous bulk took time: {} millis, size: {}", responses.getTook().getMillis(), size);
+            healthChecker.health();
+        } catch (Throwable t) {
+            healthChecker.unHealth(t);
         }
     }
 
@@ -267,11 +304,13 @@ public class ElasticSearch7Client extends ElasticSearchClient {
         BulkProcessor.Listener listener = createBulkListener();
 
         return BulkProcessor.builder(
-            (bulkRequest, bulkResponseActionListener) -> client.bulkAsync(bulkRequest, RequestOptions.DEFAULT, bulkResponseActionListener), listener)
-            .setBulkActions(bulkActions)
-            .setFlushInterval(TimeValue.timeValueSeconds(flushInterval))
-            .setConcurrentRequests(concurrentRequests)
-            .setBackoffPolicy(BackoffPolicy.exponentialBackoff(TimeValue.timeValueMillis(100), 3))
-            .build();
+            (bulkRequest, bulkResponseActionListener) -> client.bulkAsync(bulkRequest, RequestOptions.DEFAULT,
+                                                                          bulkResponseActionListener
+            ), listener)
+                            .setBulkActions(bulkActions)
+                            .setFlushInterval(TimeValue.timeValueSeconds(flushInterval))
+                            .setConcurrentRequests(concurrentRequests)
+                            .setBackoffPolicy(BackoffPolicy.exponentialBackoff(TimeValue.timeValueMillis(100), 3))
+                            .build();
     }
 }
